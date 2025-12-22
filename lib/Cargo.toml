@@ -1,78 +1,70 @@
 [package]
-name = "zecwalletlitelib"
+name = "piratewalletlitelib"
 version = "0.1.0"
+authors = ["Aditya Kulkarni <adityapk@gmail.com>"]
 edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
 default = ["embed_params"]
 embed_params = []
 
+
 [dependencies]
-base58 = "0.1.0"
-log = "0.4"
-log4rs = "0.8.3"
-dirs = "2.0.2"
-http = "0.2"
-hex = "0.3"
-protobuf = "2"
-byteorder = "1"
-json = "0.12.0"
-tiny-bip39 = "0.6.2"
-secp256k1 = "=0.15.0"
-sha2 = "0.8.0"
-ripemd160 = "0.8.0"
-lazy_static = "1.2.0"
-rust-embed = { version = "5.1.0", features = ["debug-embed"] }
-rand = "0.7.2"
-sodiumoxide = "0.2.5"
-ring = "0.16.9"
-libflate = "0.1"
-subtle = "2"
-threadpool = "1.8.0"
-num_cpus = "1.13.0"
-
-tonic = { version = "0.2.1", features = ["tls", "tls-roots"] }
+arr_macro = "0.1.3"
+base64 = "0.13.0"
 bytes = "0.4"
-prost = "0.6"
-prost-types = "0.6"
-tokio = { version = "0.2", features = ["rt-threaded", "time", "stream", "fs", "macros", "uds", "full"] }
-tokio-rustls = { version = "0.13.0" }
-webpki = "0.21.0"
-webpki-roots = "0.18.0"
+log4rs = "1.0.0"
+rand = "0.8.5"
+http = "0.2.4"
+tonic = {version = "0.7.2", features = ["tls", "tls-roots"]}
+prost = "0.10.4"
+tokio =  { version = "1.20.0", features = ["full"] }
+tokio-stream = "0.1.9"
+tokio-rustls = "0.23.4"
+futures = "0.3.21"
+log = "0.4.14"
+hex = "0.3"
+ring = "0.16.20"
+dirs = "3.0.2"
+json = "0.12.4"
+webpki-roots = "0.21.0"
 
-[dependencies.bellman]
-git = "https://github.com/adityapk00/librustzcash.git"
-rev = "ff0ffc3d1b8bc36a0ad4b6b0f06aa3ca5900d3e4"
-default-features = false
-features = ["groth16"]
+lazy_static = "1.4.0"
+secp256k1 = "=0.21.3"
+ripemd160 = "0.9.1"
+sha2 = "0.9.5"
+base58 = "0.1.0"
+tiny-bip39 = "0.8.0"
+sodiumoxide = "=0.2.5"
+byteorder = "1"
 
-[dependencies.pairing]
-git = "https://github.com/adityapk00/librustzcash.git"
-rev = "ff0ffc3d1b8bc36a0ad4b6b0f06aa3ca5900d3e4"
+pairing = "0.22"
+ff = "0.12"
+jubjub = "0.9.0"
+bls12_381 = "0.7"
+group = "0.12"
 
-[dependencies.zcash_client_backend]
-git = "https://github.com/adityapk00/librustzcash.git"
-rev = "ff0ffc3d1b8bc36a0ad4b6b0f06aa3ca5900d3e4"
-default-features = false
+rust-embed = { version = "6.3.0", features = ["debug-embed"] }
 
-[dependencies.zcash_primitives]
-git = "https://github.com/adityapk00/librustzcash.git"
-rev = "ff0ffc3d1b8bc36a0ad4b6b0f06aa3ca5900d3e4"
-default-features = false
-features = ["transparent-inputs"]
+zcash_primitives = { git = "https://github.com/piratenetwork/librustzcash", rev = "f2d093fd760e59b950e93e9a4cac329f745aacf6", features = ["transparent-inputs"] }
+zcash_client_backend = { git = "https://github.com/piratenetwork/librustzcash", rev = "f2d093fd760e59b950e93e9a4cac329f745aacf6"}
+zcash_proofs = { git = "https://github.com/piratenetwork/librustzcash", rev = "f2d093fd760e59b950e93e9a4cac329f745aacf6", features = ["multicore"]}
+zcash_encoding = { git = "https://github.com/piratenetwork/librustzcash", rev = "f2d093fd760e59b950e93e9a4cac329f745aacf6"}
+zcash_note_encryption = { git = "https://github.com/piratenetwork/librustzcash", rev = "f2d093fd760e59b950e93e9a4cac329f745aacf6", features = ["pre-zip-212"]}
 
-[dependencies.zcash_proofs]
-git = "https://github.com/adityapk00/librustzcash.git"
-rev = "ff0ffc3d1b8bc36a0ad4b6b0f06aa3ca5900d3e4"
-default-features = false
+#Test local changes to librustzcash
+# zcash_primitives = { path = '../../librustzcash/zcash_primitives' , features = ["transparent-inputs"] }
+# zcash_client_backend = { path = '../../librustzcash/zcash_client_backend' }
+# zcash_proofs = { path = '../../librustzcash/zcash_proofs' , features = ["multicore"]}
+# zcash_encoding = { path = '../../librustzcash/components/zcash_encoding'}
+# zcash_note_encryption = { path = '../../librustzcash/components/zcash_note_encryption' , features = ["pre-zip-212"]}
 
-[dependencies.ff]
-git = "https://github.com/adityapk00/librustzcash.git"
-rev = "ff0ffc3d1b8bc36a0ad4b6b0f06aa3ca5900d3e4"
-features = ["ff_derive"]
-
-[build-dependencies]
-tonic-build = "0.1.1"
 
 [dev-dependencies]
+portpicker = "0.1.1"
 tempdir = "0.3.7"
+
+[build-dependencies]
+tonic-build = "0.7.2"
