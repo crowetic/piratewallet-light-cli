@@ -9,19 +9,23 @@ use crate::{
     grpc_connector::GrpcConnector,
     lightclient::lightclient_config::MAX_REORG,
     lightwallet::{self, data::WalletTx, message::Message, now, LightWallet},
+    txauth::{build_p2sh_script_sig, CustomUnauthorized, TransparentAuthContext},
 };
+use base58::FromBase58;
 use futures::{stream::FuturesUnordered, StreamExt};
 use json::{array, object, JsonValue};
 use log::{error, info, warn};
 use std::{
     cmp,
     collections::HashSet,
+    convert::TryFrom,
     fs::File,
     io::{self, BufReader, Error, ErrorKind, Read, Write},
     path::Path,
-    sync::{atomic::AtomicBool,Arc},
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
+use sha2::{Digest, Sha256};
 use tokio::{
     join,
     runtime::Runtime,
@@ -29,17 +33,46 @@ use tokio::{
     task::yield_now,
     time::sleep,
 };
-use zcash_client_backend::encoding::{decode_payment_address, encode_payment_address};
+use zcash_client_backend::{
+    address,
+    encoding::{decode_payment_address, encode_payment_address},
+};
 use zcash_primitives::{
     block::BlockHash,
     consensus::{self, BlockHeight, BranchId},
+    legacy::Script,
     memo::{Memo, MemoBytes},
-    transaction::{Transaction, TxId},
+    sapling::prover::TxProver,
+    transaction::{
+        components::{
+            amount::Amount,
+            sapling::builder::SaplingBuilder,
+            transparent::{Bundle, TxIn, TxOut},
+            OutPoint,
+        },
+        sighash::{signature_hash, SignableInput, SIGHASH_ALL},
+        txid::TxIdDigester,
+        Transaction, TransactionData, TxId, TxVersion,
+    },
 };
 use zcash_proofs::prover::LocalTxProver;
 
 pub(crate) mod checkpoints;
 pub mod lightclient_config;
+
+fn decode_base58_field(field: &str, value: &str, allow_empty: bool) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(Vec::new())
+        } else {
+            Err(format!("{} is empty", field))
+        };
+    }
+
+    value
+        .from_base58()
+        .map_err(|e| format!("Invalid base58 for {}: {:?}", field, e))
+}
 
 #[derive(Clone, Debug)]
 pub struct WalletStatus {
@@ -174,8 +207,6 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
     // }
 
     pub fn set_sapling_params(&mut self, sapling_output: &[u8], sapling_spend: &[u8]) -> Result<(), String> {
-        use sha2::{Digest, Sha256};
-
         // The hashes of the params need to match
         const SAPLING_OUTPUT_HASH: &str = "2f0ebbcbb9bb0bcffe95a397e7eba89c29eb4dde6191c339db88570e3f3fb0e4";
         const SAPLING_SPEND_HASH: &str = "8e48ffd23abb3a5fd9c5589204f32d9c31285a04b78096ba40a79b75677efc13";
@@ -1048,7 +1079,7 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
                     .collect::<Vec<JsonValue>>();
 
                 let block_height: u32 = v.block.into();
-                txns.push(object! {
+                let mut tx_entry = object! {
                     "block_height" => block_height,
                     "datetime"     => v.datetime,
                     "txid"         => format!("{}", v.txid),
@@ -1058,13 +1089,18 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
                     "fee"          => v.total_sapling_value_spent as i64
                                         + v.total_transparent_value_spent as i64
                                         - total_send as i64,
-                    "unconfirmed"    => false,
                     "incoming_metadata" => incoming_json,
                     "incoming_metadata_change" => incoming_change_json,
                     "outgoing_metadata" => outgoing_json,
                     "outgoing_metadata_change" => outgoing_change_json,
 
-                });
+                };
+
+                if v.unconfirmed {
+                    tx_entry.insert("unconfirmed", true).unwrap();
+                }
+
+                txns.push(tx_entry);
             txns
         })
         .collect::<Vec<JsonValue>>();
@@ -1819,10 +1855,294 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
     //     result.map(|(txid, _)| txid)
     // }
 
-    pub async fn do_send(&self, from: &str, addrs: Vec<(&str, u64, Option<String>)>, fee: &u64) -> Result<String, String> {
-        info!("Creating transaction");
+    pub async fn do_redeem_p2sh(
+        &self,
+        _input: &str,
+        outputs: Vec<(&str, u64, Option<String>)>,
+        fee: &u64,
+        script: &str,
+        txid: &str,
+        locktime: u64,
+        secret: &str,
+        privkey: &str,
+    ) -> Result<String, String> {
+        if !self.wallet.is_unlocked_for_spending().await {
+            return Err("Cannot spend while wallet is locked".to_string());
+        }
 
-        // println!("BranchID {:x}", branch_id);
+        if outputs.is_empty() {
+            return Err("Need at least one destination address".to_string());
+        }
+
+        let redeem_script = decode_base58_field("script", script, false)?;
+        let txid_bytes = decode_base58_field("txid", txid, false)?;
+        if txid_bytes.len() != 32 {
+            return Err("txid must be 32 bytes".to_string());
+        }
+
+        let secret_bytes = decode_base58_field("secret", secret, true)?;
+        let privkey_bytes = decode_base58_field("privkey", privkey, false)?;
+        let sk = secp256k1::SecretKey::from_slice(&privkey_bytes)
+            .map_err(|e| format!("Invalid privkey: {}", e))?;
+
+        let lock_time =
+            u32::try_from(locktime).map_err(|_| "locktime is out of range".to_string())?;
+        let sequence = if lock_time > 0 {
+            0xFFFFFFFE
+        } else {
+            0xFFFFFFFF
+        };
+
+        let latest_block = GrpcConnector::get_latest_block(self.get_server_uri()).await?;
+        let target_height = u32::try_from(latest_block.height)
+            .map_err(|_| "latest block height is out of range".to_string())?;
+        let branch_id =
+            BranchId::for_height(&self.config.get_params(), BlockHeight::from_u32(target_height));
+        let tx_version = TxVersion::suggested_for_branch(branch_id);
+        let expiry_height = BlockHeight::from_u32(target_height + 20);
+
+        let fee_amount = Amount::from_u64(*fee).map_err(|_| "Invalid fee amount".to_string())?;
+        let mut outputs_total = Amount::zero();
+        let mut transparent_vout = Vec::new();
+        let mut sapling_builder =
+            SaplingBuilder::new(self.config.get_params().clone(), BlockHeight::from_u32(target_height));
+        let mut rng = rand::rngs::OsRng;
+
+        for (addr, amt, memo) in outputs {
+            let recipient = address::RecipientAddress::decode(&self.config.get_params(), addr)
+                .ok_or_else(|| format!("Invalid recipient address: '{}'", addr))?;
+            let value = Amount::from_u64(amt)
+                .map_err(|_| format!("Invalid amount for '{}'", addr))?;
+            outputs_total = (outputs_total + value)
+                .ok_or_else(|| "Invalid output amount total".to_string())?;
+
+            match recipient {
+                address::RecipientAddress::Shielded(to) => {
+                    let encoded_memo = match memo {
+                        None => MemoBytes::empty(),
+                        Some(s) => lightwallet::utils::interpret_memo_string(s)
+                            .map_err(|e| format!("Error adding memo: {}", e))?,
+                    };
+                    sapling_builder
+                        .add_output(&mut rng, None, to, value, encoded_memo)
+                        .map_err(|e| format!("Error adding shielded output: {}", e))?;
+                }
+                address::RecipientAddress::Transparent(to) => {
+                    transparent_vout.push(TxOut {
+                        value,
+                        script_pubkey: to.script(),
+                    });
+                }
+            }
+        }
+
+        let expected_total = (outputs_total + fee_amount)
+            .ok_or_else(|| "Invalid output total".to_string())?;
+
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&txid_bytes);
+        let outpoint = OutPoint::new(txid_arr, 0);
+        let funding_coin = TxOut {
+            value: expected_total,
+            script_pubkey: Script(redeem_script.clone()),
+        };
+
+        let vin = vec![TxIn {
+            prevout: outpoint.clone(),
+            script_sig: (),
+            sequence,
+        }];
+        let transparent_bundle = Some(Bundle {
+            vin,
+            vout: transparent_vout.clone(),
+            authorization: TransparentAuthContext {
+                input_amounts: vec![funding_coin.value],
+                input_scriptpubkeys: vec![funding_coin.script_pubkey.clone()],
+            },
+        });
+
+        let prover = LocalTxProver::from_bytes(&self.sapling_spend, &self.sapling_output);
+        let mut ctx = prover.new_sapling_proving_context();
+        let sapling_bundle = sapling_builder
+            .build(&prover, &mut ctx, &mut rng, BlockHeight::from_u32(target_height), None)
+            .map_err(|e| format!("Error building Sapling bundle: {}", e))?;
+
+        let unauth_tx = TransactionData::<CustomUnauthorized>::from_parts(
+            tx_version,
+            branch_id,
+            lock_time,
+            expiry_height,
+            transparent_bundle.clone(),
+            None,
+            sapling_bundle.clone(),
+            None,
+            #[cfg(feature = "zfuture")]
+            None,
+        );
+
+        let txid_parts = unauth_tx.digest(TxIdDigester);
+
+        let redeem_script_code = Script(redeem_script.clone());
+        let sighash = signature_hash(
+            &unauth_tx,
+            &SignableInput::Transparent {
+                hash_type: SIGHASH_ALL,
+                index: 0,
+                script_code: &redeem_script_code,
+                script_pubkey: &funding_coin.script_pubkey,
+                value: funding_coin.value,
+            },
+            &txid_parts,
+        );
+
+        let msg = secp256k1::Message::from_slice(sighash.as_ref())
+            .map_err(|e| format!("Invalid signature hash: {}", e))?;
+        let secp = secp256k1::Secp256k1::signing_only();
+        let sig = secp.sign_ecdsa(&msg, &sk);
+        let mut sig_bytes = sig.serialize_der().to_vec();
+        sig_bytes.push(SIGHASH_ALL);
+        let script_sig = build_p2sh_script_sig(&sig_bytes, &secret_bytes, &redeem_script);
+
+        let signed_transparent_bundle = Some(Bundle {
+            vin: vec![TxIn {
+                prevout: outpoint,
+                script_sig,
+                sequence,
+            }],
+            vout: transparent_vout,
+            authorization: zcash_primitives::transaction::components::transparent::Authorized,
+        });
+
+        let shielded_sighash = signature_hash(&unauth_tx, &SignableInput::Shielded, &txid_parts);
+        let signed_sapling_bundle = match sapling_bundle {
+            Some(bundle) => Some(
+                bundle
+                    .apply_signatures(&prover, &mut ctx, &mut rng, shielded_sighash.as_ref())
+                    .map_err(|e| format!("Error signing Sapling bundle: {}", e))?
+                    .0,
+            ),
+            None => None,
+        };
+
+        let authorized_tx = TransactionData::from_parts(
+            tx_version,
+            branch_id,
+            lock_time,
+            expiry_height,
+            signed_transparent_bundle,
+            None,
+            signed_sapling_bundle,
+            None,
+            #[cfg(feature = "zfuture")]
+            None,
+        );
+
+        let tx = authorized_tx
+            .freeze()
+            .map_err(|e| format!("Error finalizing transaction: {}", e))?;
+        let txid_obj = tx.txid();
+        let now_ts = now();
+        let mut raw_tx = vec![];
+        tx.write(&mut raw_tx)
+            .map_err(|e| format!("Error serializing transaction: {}", e))?;
+
+        let txid =
+            GrpcConnector::send_transaction(self.get_server_uri(), raw_tx.into_boxed_slice())
+                .await?;
+
+        // Mark any wallet notes/utxos spent by this tx as unconfirmed.
+        {
+            let mut txs = self.wallet.txns.write().await;
+
+            if let Some(s_bundle) = tx.sapling_bundle() {
+                for spend in s_bundle.shielded_spends.iter() {
+                    for wtx in txs.current.values_mut() {
+                        if let Some(note) = wtx
+                            .notes
+                            .iter_mut()
+                            .find(|nd| nd.nullifier == spend.nullifier)
+                        {
+                            note.unconfirmed_spent = Some((txid_obj.clone(), target_height));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(t_bundle) = tx.transparent_bundle() {
+                for vin in t_bundle.vin.iter() {
+                    let prev_txid = TxId::from_bytes(*vin.prevout.hash());
+                    let prev_n = vin.prevout.n() as u64;
+                    if let Some(wtx) = txs.current.get_mut(&prev_txid) {
+                        if let Some(utxo) = wtx
+                            .utxos
+                            .iter_mut()
+                            .find(|u| u.txid == prev_txid && u.output_index == prev_n)
+                        {
+                            utxo.unconfirmed_spent = Some((txid_obj.clone(), target_height));
+                        }
+                    }
+                }
+            }
+        }
+
+        let price = self.wallet.price.read().await.clone();
+        FetchFullTxns::<P>::scan_full_tx(
+            self.config.clone(),
+            tx,
+            BlockHeight::from_u32(target_height),
+            true,
+            now_ts as u32,
+            self.wallet.keys(),
+            self.wallet.txns(),
+            WalletTx::get_price(now_ts, &price),
+        )
+        .await;
+
+        Ok(txid)
+    }
+
+    pub async fn do_send_p2sh(
+        &self,
+        from: &str,
+        addrs: Vec<(&str, u64, Option<String>)>,
+        fee: &u64,
+        script: &str,
+    ) -> Result<String, String> {
+        if !self.wallet.is_unlocked_for_spending().await {
+            return Err("Cannot spend while wallet is locked".to_string());
+        }
+
+        info!("Creating P2SH transaction");
+
+        let script_bytes = decode_base58_field("script", script, false)?;
+
+        let result = {
+            let _lock = self.sync_lock.lock().await;
+            let prover = LocalTxProver::from_bytes(&self.sapling_spend, &self.sapling_output);
+
+            self.wallet
+                .send_to_p2sh_with_redeem_script(
+                    prover,
+                    from,
+                    addrs,
+                    script_bytes,
+                    fee,
+                    |txbytes| GrpcConnector::send_transaction(self.get_server_uri(), txbytes),
+                )
+                .await
+        };
+
+        result.map(|(txid, _)| txid)
+    }
+
+    pub async fn do_send(
+        &self,
+        from: &str,
+        addrs: Vec<(&str, u64, Option<String>)>,
+        fee: &u64,
+    ) -> Result<String, String> {
+        info!("Creating transaction");
 
         let result = {
             let _lock = self.sync_lock.lock().await;
@@ -1830,7 +2150,7 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
             let prover = LocalTxProver::from_bytes(&self.sapling_spend, &self.sapling_output);
 
             self.wallet
-                .send_to_address(prover, false, from, addrs, fee, |txbytes| {
+                .send_to_address(prover, false, from, addrs, fee, None, |txbytes| {
                     GrpcConnector::send_transaction(self.get_server_uri(), txbytes)
                 })
                 .await
@@ -1840,7 +2160,12 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
     }
 
     #[cfg(test)]
-    pub async fn test_do_send(&self, from: &str, addrs: Vec<(&str, u64, Option<String>)>, fee: &u64) -> Result<String, String> {
+    pub async fn test_do_send(
+        &self,
+        from: &str,
+        addrs: Vec<(&str, u64, Option<String>)>,
+        fee: &u64,
+    ) -> Result<String, String> {
         info!("Creating transaction");
 
         let result = {
@@ -1848,7 +2173,7 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightClient<P> {
             let prover = crate::blaze::test_utils::FakeTxProver {};
 
             self.wallet
-                .send_to_address(prover, false, from, addrs, fee, |txbytes| {
+                .send_to_address(prover, false, from, addrs, fee, None, |txbytes| {
                     GrpcConnector::send_transaction(self.get_server_uri(), txbytes)
                 })
                 .await

@@ -7,6 +7,7 @@ pub mod compact_formats;
 pub mod grpc_connector;
 pub mod lightclient;
 pub mod lightwallet;
+pub mod txauth;
 
 #[cfg(feature = "embed_params")]
 #[derive(RustEmbed)]

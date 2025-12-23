@@ -8,10 +8,16 @@ use crate::{
         data::SpendableNote,
         walletzkey::{WalletZKey, WalletZKeyType},
     },
+    txauth::{
+        build_op_return_script, build_p2pkh_script_sig, build_script_pubkey, CustomUnauthorized,
+        TransparentAuthContext,
+    },
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::Future;
 use log::{error, info, warn};
+use rand::rngs::OsRng;
+use secp256k1::PublicKey;
 use std::sync::mpsc;
 use std::{
     cmp,
@@ -28,14 +34,21 @@ use zcash_client_backend::{
 use zcash_encoding::{Optional, Vector};
 use zcash_primitives::consensus;
 use zcash_primitives::memo::MemoBytes;
-use zcash_primitives::sapling::prover::TxProver;
+use zcash_primitives::sapling::{prover::TxProver, PaymentAddress};
 use zcash_primitives::{
     consensus::BlockHeight,
     legacy::Script,
     memo::Memo,
     transaction::{
         builder::Builder,
-        components::{Amount, OutPoint, TxOut},
+        components::{
+            sapling::builder::SaplingBuilder,
+            transparent::{self, Bundle, TxIn},
+            Amount, OutPoint, TxOut,
+        },
+        sighash::{signature_hash, SignableInput, SIGHASH_ALL},
+        txid::TxIdDigester,
+        TransactionData, TxVersion,
     },
     zip32::ExtendedFullViewingKey,
 };
@@ -172,6 +185,11 @@ pub struct LightWallet<P> {
     // The current price of ARRR. (time_fetched, price in USD)
     pub price: Arc<RwLock<WalletArrrPriceInfo>>,
 
+}
+
+enum ScriptOutputMode {
+    Raw,
+    OpReturn,
 }
 
 impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
@@ -1107,6 +1125,7 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
         from: &str,
         tos: Vec<(&str, u64, Option<String>)>,
         fee: &u64,
+        script_bytes: Option<Vec<u8>>,
         broadcast_fn: F,
     ) -> Result<(String, Vec<u8>), String>
     where
@@ -1118,7 +1137,57 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
 
         // Call the internal function
         match self
-            .send_to_address_internal(prover, transparent_only, from, tos, fee, broadcast_fn)
+            .send_to_address_internal(
+                prover,
+                transparent_only,
+                from,
+                tos,
+                fee,
+                script_bytes,
+                ScriptOutputMode::OpReturn,
+                false,
+                broadcast_fn,
+            )
+            .await
+        {
+            Ok((txid, rawtx)) => {
+                self.set_send_success(txid.clone()).await;
+                Ok((txid, rawtx))
+            }
+            Err(e) => {
+                self.set_send_error(format!("{}", e)).await;
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn send_to_p2sh_with_redeem_script<F, Fut, PR: TxProver>(
+        &self,
+        prover: PR,
+        from: &str,
+        tos: Vec<(&str, u64, Option<String>)>,
+        redeem_script_pubkey: Vec<u8>,
+        fee: &u64,
+        broadcast_fn: F,
+    ) -> Result<(String, Vec<u8>), String>
+    where
+        F: Fn(Box<[u8]>) -> Fut,
+        Fut: Future<Output = Result<String, String>>,
+    {
+        self.reset_send_progress().await;
+
+        match self
+            .send_to_address_internal(
+                prover,
+                false,
+                from,
+                tos,
+                fee,
+                Some(redeem_script_pubkey),
+                ScriptOutputMode::Raw,
+                true,
+                broadcast_fn,
+            )
             .await
         {
             Ok((txid, rawtx)) => {
@@ -1139,6 +1208,9 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
         from: &str,
         tos: Vec<(&str, u64, Option<String>)>,
         fee: &u64,
+        script_bytes: Option<Vec<u8>>,
+        script_output_mode: ScriptOutputMode,
+        script_each_recipient: bool,
         broadcast_fn: F,
     ) -> Result<(String, Vec<u8>), String>
     where
@@ -1188,12 +1260,20 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
             None => return Err("No blocks in wallet to target, please sync first".to_string()),
         };
 
-        let (progress_notifier, progress_notifier_rx) = mpsc::channel();
-        let mut builder = Builder::new(self.config.get_params().clone(), target_height);
-        builder.with_progress_notifier(progress_notifier);
+        let script_output = match script_bytes {
+            Some(bytes) => {
+                let script = match script_output_mode {
+                    ScriptOutputMode::Raw => build_script_pubkey(&bytes)?,
+                    ScriptOutputMode::OpReturn => build_op_return_script(&bytes)?,
+                };
+                Some(script)
+            }
+            None => None,
+        };
 
-        //set fee
-        builder.set_fee(Amount::from_u64(*fee).unwrap());
+        if script_each_recipient && script_output.is_none() {
+            return Err("Script output is required".to_string());
+        }
 
         // Create a map from address -> sk for all taddrs, so we can spend from the
         // right address
@@ -1221,45 +1301,6 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
             utxos.len()
         );
 
-        // Add all tinputs
-        utxos
-            .iter()
-            .map(|utxo| {
-                let outpoint: OutPoint = utxo.to_outpoint();
-
-                let coin = TxOut {
-                    value: Amount::from_u64(utxo.value).unwrap(),
-                    script_pubkey: Script { 0: utxo.script.clone() },
-                };
-
-                match address_to_sk.get(&utxo.address) {
-                    Some(sk) => builder.add_transparent_input(*sk, outpoint.clone(), coin.clone()),
-                    None => {
-                        // Something is very wrong
-                        let e = format!("Couldn't find the secreykey for taddr {}", utxo.address);
-                        error!("{}", e);
-
-                        Err(zcash_primitives::transaction::builder::Error::InvalidAmount)
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{:?}", e))?;
-
-        for selected in notes.iter() {
-            if let Err(e) = builder.add_sapling_spend(
-                selected.extsk.clone(),
-                selected.diversifier,
-                selected.note.clone(),
-                selected.witness.path().unwrap(),
-            ) {
-                let e = format!("Error adding note: {:?}", e);
-                error!("{}", e);
-                return Err(e);
-            }
-        }
-
-
         // Use the ovk belonging to the address being sent from, if not using any notes
         // use the first address in the wallet for the ovk.
         let ovk = if notes.len() == 0 {
@@ -1268,116 +1309,472 @@ impl<P: consensus::Parameters + Send + Sync + 'static> LightWallet<P> {
             ExtendedFullViewingKey::from(&notes[0].extsk).fvk.ovk
         };
 
-        // If no Sapling notes were added, add the change address manually. That is,
-        // send the change back to the transparent address being used,
-        // the builder will automatically send change back to the sapling address if notes are used.
-        if notes.len() == 0 && u64::from(selected_value) - u64::from(target_value) > 0 {
+        let change = (selected_value - target_value).unwrap_or(Amount::zero());
 
-            println!("{}: Adding change output", now() - start_time);
-
-            // let from_addr = address::RecipientAddress::from_str(from,
-            //                 self.config.hrp_sapling_address(),
-            //                 self.config.base58_pubkey_address(),
-            //                 self.config.base58_script_address()).unwrap();
-
-            let from_addr = address::RecipientAddress::decode(&self.config.get_params(), from).unwrap();
-
-            if let Err(e) =  match from_addr {
-                address::RecipientAddress::Shielded(from_addr) => {
-                    builder.add_sapling_output(Some(ovk), from_addr.clone(), (selected_value - target_value).unwrap(), MemoBytes::empty())
-                }
-                address::RecipientAddress::Transparent(from_addr) => {
-                    builder.add_transparent_output(&from_addr, (selected_value - target_value).unwrap())
-                }
-            } {
-                let e = format!("Error adding transparent change output: {:?}", e);
-                error!("{}", e);
-                return Err(e);
+        let tx = if let Some(script_output) = script_output {
+            struct TransparentInputSigner {
+                outpoint: OutPoint,
+                sequence: u32,
+                sk: secp256k1::SecretKey,
+                pubkey: Vec<u8>,
+                coin: TxOut,
             }
-        }
 
+            let secp = secp256k1::Secp256k1::signing_only();
+            let mut transparent_inputs = Vec::new();
+            let mut input_amounts = Vec::new();
+            let mut input_scriptpubkeys = Vec::new();
+            let mut vin = Vec::new();
+            let mut transparent_vout = Vec::new();
+            let mut sapling_builder =
+                SaplingBuilder::new(self.config.get_params().clone(), target_height);
+            let mut rng = OsRng;
 
+            // Add all tinputs
+            for utxo in utxos.iter() {
+                let outpoint: OutPoint = utxo.to_outpoint();
+                let coin = TxOut {
+                    value: Amount::from_u64(utxo.value).unwrap(),
+                    script_pubkey: Script { 0: utxo.script.clone() },
+                };
 
-        let mut total_z_recepients = 0;
-        for (to, value, memo) in recepients {
-            // Compute memo if it exists
-            let encoded_memo = match memo {
-                None => MemoBytes::empty(),
-                Some(s) => {
-                    // If the string starts with an "0x", and contains only hex chars ([a-f0-9]+) then
-                    // interpret it as a hex
-                    match utils::interpret_memo_string(s) {
+                match address_to_sk.get(&utxo.address) {
+                    Some(sk) => {
+                        let pubkey = PublicKey::from_secret_key(&secp, sk).serialize().to_vec();
+                        transparent_inputs.push(TransparentInputSigner {
+                            outpoint: outpoint.clone(),
+                            sequence: std::u32::MAX,
+                            sk: sk.clone(),
+                            pubkey,
+                            coin: coin.clone(),
+                        });
+                        vin.push(TxIn {
+                            prevout: outpoint,
+                            script_sig: (),
+                            sequence: std::u32::MAX,
+                        });
+                        input_amounts.push(coin.value);
+                        input_scriptpubkeys.push(coin.script_pubkey.clone());
+                    }
+                    None => {
+                        let e = format!("Couldn't find the secreykey for taddr {}", utxo.address);
+                        error!("{}", e);
+                        return Err(e);
+                    }
+                }
+            }
+
+            for selected in notes.iter() {
+                if let Err(e) = sapling_builder.add_spend(
+                    &mut rng,
+                    selected.extsk.clone(),
+                    selected.diversifier,
+                    selected.note.clone(),
+                    selected.witness.path().unwrap(),
+                ) {
+                    let e = format!("Error adding note: {:?}", e);
+                    error!("{}", e);
+                    return Err(e);
+                }
+            }
+
+            // If no Sapling notes were added, add the change address manually. That is,
+            // send the change back to the transparent address being used,
+            // the builder will automatically send change back to the sapling address if notes are used.
+            if change.is_positive() {
+                println!("{}: Adding change output", now() - start_time);
+                if notes.len() == 0 {
+                    let from_addr =
+                        address::RecipientAddress::decode(&self.config.get_params(), from).unwrap();
+
+                    if let Err(e) = match from_addr {
+                        address::RecipientAddress::Shielded(from_addr) => sapling_builder.add_output(
+                            &mut rng,
+                            Some(ovk),
+                            from_addr.clone(),
+                            change,
+                            MemoBytes::empty(),
+                        ),
+                        address::RecipientAddress::Transparent(from_addr) => {
+                            transparent_vout.push(TxOut {
+                                value: change,
+                                script_pubkey: from_addr.script(),
+                            });
+                            Ok(())
+                        }
+                    } {
+                        let e = format!("Error adding transparent change output: {:?}", e);
+                        error!("{}", e);
+                        return Err(e);
+                    }
+                } else {
+                    let change_addr = PaymentAddress::from_parts(
+                        notes[0].diversifier,
+                        notes[0].note.pk_d,
+                    )
+                    .ok_or_else(|| "Invalid change address".to_string())?;
+
+                    if let Err(e) =
+                        sapling_builder.add_output(&mut rng, Some(ovk), change_addr, change, MemoBytes::empty())
+                    {
+                        let e = format!("Error adding Sapling change output: {:?}", e);
+                        error!("{}", e);
+                        return Err(e);
+                    }
+                }
+            }
+
+            let mut total_z_recepients = 0;
+            for (to, value, memo) in recepients.iter() {
+                let encoded_memo = match memo {
+                    None => MemoBytes::empty(),
+                    Some(s) => match utils::interpret_memo_string(s.to_string()) {
                         Ok(m) => m,
                         Err(e) => {
                             error!("{}", e);
                             return Err(e);
                         }
+                    },
+                };
+
+                println!("{}: Adding outputs", now() - start_time);
+
+                if let Err(e) = match to {
+                    address::RecipientAddress::Shielded(to) => {
+                        total_z_recepients += 1;
+                        sapling_builder.add_output(&mut rng, Some(ovk), to.clone(), *value, encoded_memo)
                     }
+                    address::RecipientAddress::Transparent(to) => {
+                        transparent_vout.push(TxOut {
+                            value: *value,
+                            script_pubkey: to.script(),
+                        });
+                        Ok(())
+                    }
+                } {
+                    let e = format!("Error adding output: {:?}", e);
+                    error!("{}", e);
+                    return Err(e);
+                }
+
+                if script_each_recipient {
+                    transparent_vout.push(TxOut {
+                        value: Amount::zero(),
+                        script_pubkey: script_output.clone(),
+                    });
+                }
+            }
+
+            if !script_each_recipient {
+                transparent_vout.push(TxOut {
+                    value: Amount::zero(),
+                    script_pubkey: script_output,
+                });
+            }
+
+            let (progress_notifier, progress_notifier_rx) =
+                mpsc::channel::<zcash_primitives::transaction::builder::Progress>();
+            let progress = self.send_progress.clone();
+            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+            std::thread::spawn(move || {
+                while let Ok(r) = progress_notifier_rx.recv() {
+                    tx2.send(r.cur()).unwrap();
+                }
+            });
+
+            let progress_handle = tokio::spawn(async move {
+                while let Some(r) = rx2.recv().await {
+                    println!("Progress: {}", r);
+                    progress.write().await.progress = r;
+                }
+
+                progress.write().await.is_send_in_progress = false;
+            });
+
+            {
+                let mut p = self.send_progress.write().await;
+                p.is_send_in_progress = true;
+                p.progress = 0;
+                p.total = notes.len() as u32 + total_z_recepients;
+            }
+
+            println!("{}: Building transaction", now() - start_time);
+            let mut ctx = prover.new_sapling_proving_context();
+            let sapling_bundle = match sapling_builder.build(
+                &prover,
+                &mut ctx,
+                &mut rng,
+                target_height,
+                Some(&progress_notifier),
+            ) {
+                Ok(res) => res,
+                Err(e) => {
+                    let e = format!("Error building Sapling bundle: {:?}", e);
+                    error!("{}", e);
+                    self.send_progress.write().await.is_send_in_progress = false;
+                    return Err(e);
+                }
+            };
+            drop(progress_notifier);
+
+            let transparent_bundle = if vin.is_empty() && transparent_vout.is_empty() {
+                None
+            } else {
+                Some(Bundle {
+                    vin,
+                    vout: transparent_vout.clone(),
+                    authorization: TransparentAuthContext {
+                        input_amounts,
+                        input_scriptpubkeys,
+                    },
+                })
+            };
+
+            let branch_id = consensus::BranchId::for_height(&self.config.get_params(), target_height);
+            let tx_version = TxVersion::suggested_for_branch(branch_id);
+            let expiry_height = target_height + 20;
+
+            let unauth_tx = TransactionData::<CustomUnauthorized>::from_parts(
+                tx_version,
+                branch_id,
+                0,
+                expiry_height,
+                transparent_bundle.clone(),
+                None,
+                sapling_bundle.clone(),
+                None,
+                #[cfg(feature = "zfuture")]
+                None,
+            );
+
+            let txid_parts = unauth_tx.digest(TxIdDigester);
+            let mut signed_vin = Vec::new();
+            for (index, input) in transparent_inputs.iter().enumerate() {
+                let sighash = signature_hash(
+                    &unauth_tx,
+                    &SignableInput::Transparent {
+                        hash_type: SIGHASH_ALL,
+                        index,
+                        script_code: &input.coin.script_pubkey,
+                        script_pubkey: &input.coin.script_pubkey,
+                        value: input.coin.value,
+                    },
+                    &txid_parts,
+                );
+
+                let msg = secp256k1::Message::from_slice(sighash.as_ref())
+                    .map_err(|e| format!("Invalid signature hash: {}", e))?;
+                let sig = secp.sign_ecdsa(&msg, &input.sk);
+                let mut sig_bytes = sig.serialize_der().to_vec();
+                sig_bytes.push(SIGHASH_ALL);
+                let script_sig = build_p2pkh_script_sig(&sig_bytes, &input.pubkey);
+
+                signed_vin.push(TxIn {
+                    prevout: input.outpoint.clone(),
+                    script_sig,
+                    sequence: input.sequence,
+                });
+            }
+
+            let signed_transparent_bundle = if transparent_bundle.is_some() {
+                Some(Bundle {
+                    vin: signed_vin,
+                    vout: transparent_vout,
+                    authorization: transparent::Authorized,
+                })
+            } else {
+                None
+            };
+
+            let shielded_sighash = signature_hash(&unauth_tx, &SignableInput::Shielded, &txid_parts);
+            let signed_sapling_bundle = match sapling_bundle {
+                Some(bundle) => Some(
+                    bundle
+                        .apply_signatures(&prover, &mut ctx, &mut rng, shielded_sighash.as_ref())
+                        .map_err(|e| format!("Error signing Sapling bundle: {}", e))?
+                        .0,
+                ),
+                None => None,
+            };
+
+            let authorized_tx = TransactionData::from_parts(
+                tx_version,
+                branch_id,
+                0,
+                expiry_height,
+                signed_transparent_bundle,
+                None,
+                signed_sapling_bundle,
+                None,
+                #[cfg(feature = "zfuture")]
+                None,
+            );
+
+            let tx = authorized_tx
+                .freeze()
+                .map_err(|e| format!("Error creating transaction: {}", e))?;
+
+            progress_handle.await.unwrap();
+
+            println!("{}: Transaction created", now() - start_time);
+            println!("Transaction ID: {}", tx.txid());
+
+            {
+                self.send_progress.write().await.is_send_in_progress = false;
+            }
+
+            tx
+        } else {
+            let (progress_notifier, progress_notifier_rx) =
+                mpsc::channel::<zcash_primitives::transaction::builder::Progress>();
+            let mut builder = Builder::new(self.config.get_params().clone(), target_height);
+            builder.with_progress_notifier(progress_notifier);
+
+            //set fee
+            builder.set_fee(Amount::from_u64(*fee).unwrap());
+
+            // Add all tinputs
+            utxos
+                .iter()
+                .map(|utxo| {
+                    let outpoint: OutPoint = utxo.to_outpoint();
+
+                    let coin = TxOut {
+                        value: Amount::from_u64(utxo.value).unwrap(),
+                        script_pubkey: Script { 0: utxo.script.clone() },
+                    };
+
+                    match address_to_sk.get(&utxo.address) {
+                        Some(sk) => builder.add_transparent_input(*sk, outpoint.clone(), coin.clone()),
+                        None => {
+                            // Something is very wrong
+                            let e = format!("Couldn't find the secreykey for taddr {}", utxo.address);
+                            error!("{}", e);
+
+                            Err(zcash_primitives::transaction::builder::Error::InvalidAmount)
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("{:?}", e))?;
+
+            for selected in notes.iter() {
+                if let Err(e) = builder.add_sapling_spend(
+                    selected.extsk.clone(),
+                    selected.diversifier,
+                    selected.note.clone(),
+                    selected.witness.path().unwrap(),
+                ) {
+                    let e = format!("Error adding note: {:?}", e);
+                    error!("{}", e);
+                    return Err(e);
+                }
+            }
+
+            // If no Sapling notes were added, add the change address manually. That is,
+            // send the change back to the transparent address being used,
+            // the builder will automatically send change back to the sapling address if notes are used.
+            if notes.len() == 0 && change.is_positive() {
+                println!("{}: Adding change output", now() - start_time);
+
+                let from_addr =
+                    address::RecipientAddress::decode(&self.config.get_params(), from).unwrap();
+
+                if let Err(e) = match from_addr {
+                    address::RecipientAddress::Shielded(from_addr) => builder.add_sapling_output(
+                        Some(ovk),
+                        from_addr.clone(),
+                        change,
+                        MemoBytes::empty(),
+                    ),
+                    address::RecipientAddress::Transparent(from_addr) => {
+                        builder.add_transparent_output(&from_addr, change)
+                    }
+                } {
+                    let e = format!("Error adding transparent change output: {:?}", e);
+                    error!("{}", e);
+                    return Err(e);
+                }
+            }
+
+            let mut total_z_recepients = 0;
+            for (to, value, memo) in recepients.iter() {
+                let encoded_memo = match memo {
+                    None => MemoBytes::empty(),
+                    Some(s) => match utils::interpret_memo_string(s.to_string()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!("{}", e);
+                            return Err(e);
+                        }
+                    },
+                };
+
+                println!("{}: Adding outputs", now() - start_time);
+
+                if let Err(e) = match to {
+                    address::RecipientAddress::Shielded(to) => {
+                        total_z_recepients += 1;
+                        builder.add_sapling_output(Some(ovk), to.clone(), *value, encoded_memo)
+                    }
+                    address::RecipientAddress::Transparent(to) => builder.add_transparent_output(&to, *value),
+                } {
+                    let e = format!("Error adding output: {:?}", e);
+                    error!("{}", e);
+                    return Err(e);
+                }
+            }
+
+            // Set up a channel to recieve updates on the progress of building the transaction.
+            let progress = self.send_progress.clone();
+
+            // Use a separate thread to handle sending from std::mpsc to tokio::sync::mpsc
+            let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+            std::thread::spawn(move || {
+                while let Ok(r) = progress_notifier_rx.recv() {
+                    tx2.send(r.cur()).unwrap();
+                }
+            });
+
+            let progress_handle = tokio::spawn(async move {
+                while let Some(r) = rx2.recv().await {
+                    println!("Progress: {}", r);
+                    progress.write().await.progress = r;
+                }
+
+                progress.write().await.is_send_in_progress = false;
+            });
+
+            {
+                let mut p = self.send_progress.write().await;
+                p.is_send_in_progress = true;
+                p.progress = 0;
+                p.total = notes.len() as u32 + total_z_recepients;
+            }
+
+            println!("{}: Building transaction", now() - start_time);
+            let (tx, _) = match builder.build(&prover) {
+                Ok(res) => res,
+                Err(e) => {
+                    let e = format!("Error creating transaction: {:?}", e);
+                    error!("{}", e);
+                    self.send_progress.write().await.is_send_in_progress = false;
+                    return Err(e);
                 }
             };
 
-            println!("{}: Adding outputs", now() - start_time);
+            // Wait for all the progress to be updated
+            progress_handle.await.unwrap();
 
-            if let Err(e) = match to {
-                address::RecipientAddress::Shielded(to) => {
-                    total_z_recepients += 1;
-                    builder.add_sapling_output(Some(ovk), to.clone(), value, encoded_memo)
-                }
-                address::RecipientAddress::Transparent(to) => builder.add_transparent_output(&to, value),
-            } {
-                let e = format!("Error adding output: {:?}", e);
-                error!("{}", e);
-                return Err(e);
-            }
-        }
+            println!("{}: Transaction created", now() - start_time);
+            println!("Transaction ID: {}", tx.txid());
 
-        // Set up a channel to recieve updates on the progress of building the transaction.
-        let progress = self.send_progress.clone();
-
-        // Use a separate thread to handle sending from std::mpsc to tokio::sync::mpsc
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        std::thread::spawn(move || {
-            while let Ok(r) = progress_notifier_rx.recv() {
-                tx2.send(r.cur()).unwrap();
-            }
-        });
-
-        let progress_handle = tokio::spawn(async move {
-            while let Some(r) = rx2.recv().await {
-                println!("Progress: {}", r);
-                progress.write().await.progress = r;
-            }
-
-            progress.write().await.is_send_in_progress = false;
-        });
-
-        {
-            let mut p = self.send_progress.write().await;
-            p.is_send_in_progress = true;
-            p.progress = 0;
-            p.total = notes.len() as u32 + total_z_recepients;
-        }
-
-        println!("{}: Building transaction", now() - start_time);
-        let (tx, _) = match builder.build(&prover) {
-            Ok(res) => res,
-            Err(e) => {
-                let e = format!("Error creating transaction: {:?}", e);
-                error!("{}", e);
+            {
                 self.send_progress.write().await.is_send_in_progress = false;
-                return Err(e);
             }
+
+            tx
         };
-
-        // Wait for all the progress to be updated
-        progress_handle.await.unwrap();
-
-        println!("{}: Transaction created", now() - start_time);
-        println!("Transaction ID: {}", tx.txid());
-
-        {
-            self.send_progress.write().await.is_send_in_progress = false;
-        }
 
         // Create the TX bytes
         let mut raw_tx = vec![];

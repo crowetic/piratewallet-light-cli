@@ -25,10 +25,15 @@ New fields when not syncing:
 ### `list`
 - Always includes `incoming_metadata` and `outgoing_metadata`.
 - Adds `incoming_metadata_change` and `outgoing_metadata_change`.
-- Includes `unconfirmed` (false for confirmed transactions).
-- Mempool entries are no longer appended to the list output.
+- Includes `unconfirmed` only for unconfirmed transactions (omitted for confirmed).
+- Mempool entries are no longer appended to the list output; unconfirmed txs are tracked in wallet state instead.
 - `amount` and `fee` now account for both shielded and transparent totals.
 
 ### `balance`
 Keys are unchanged, but with t-address support disabled by default:
 - `t_addresses` is empty and `tbalance` is zero unless t-addresses are explicitly added.
+
+### P2SH HTLC Commands
+- `sendp2sh` is restored and expects `script` to be Base58-encoded output script bytes (typically `OP_RETURN` + `OP_PUSHDATA1` + redeem script). The script output is added once per recipient, matching prior Qortal behavior.
+- `redeemp2sh` is restored and expects Base58-encoded raw bytes for `script`, `txid`, `secret` (empty for refund), and `privkey` (32-byte raw). It spends output index 0 without validating funding output value or script hash.
+- `send` does not accept `script`; use `sendp2sh` for HTLC funding.

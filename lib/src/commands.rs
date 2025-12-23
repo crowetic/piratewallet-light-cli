@@ -833,6 +833,285 @@ impl<P: consensus::Parameters + Send + Sync + 'static> Command<P> for SendComman
     }
 }
 
+struct SendP2shCommand {}
+
+impl<P: consensus::Parameters + Send + Sync + 'static> Command<P> for SendP2shCommand {
+    fn help(&self) -> String {
+        let mut h = vec![];
+        h.push("Send ARRR to a given address(es), including a redeem script output");
+        h.push("Usage:");
+        h.push("sendp2sh '{'input': <address>, 'output': [{'address': <address>, 'amount': <amount in zatoshis>, 'memo': <optional memo>}, ...], 'script': <base58>, 'fee': <fee>}'");
+        h.push("");
+        h.push("Fields:");
+        h.push("input  : address to spend from");
+        h.push("output : array of outputs");
+        h.push("script : Base58-encoded redeem script output (push-only OP_RETURN script)");
+        h.push("fee    : fee in zatoshis");
+        h.push("");
+        h.join("\n")
+    }
+
+    fn short_help(&self) -> String {
+        "Send ARRR to a P2SH address, including the redeem script output".to_string()
+    }
+
+    fn exec(&self, args: &[&str], lightclient: &LightClient<P>) -> String {
+        if args.len() != 1 {
+            return Command::<P>::help(self);
+        }
+
+        RT.block_on(async move {
+            let arg_list = args[0];
+
+            let json_args = match json::parse(&arg_list) {
+                Ok(j) => j,
+                Err(e) => {
+                    let es = format!("Couldn't understand JSON: {}", e);
+                    return format!("{}\n{}", es, Command::<P>::help(self));
+                }
+            };
+
+            let from = if json_args.has_key("input") {
+                json_args["input"].as_str().unwrap().clone()
+            } else {
+                return format!("Error: {}\n{}", "Need input address", Command::<P>::help(self));
+            };
+
+            let json_tos = if json_args.has_key("output") {
+                &json_args["output"]
+            } else {
+                return format!("Error: {}\n{}", "Need output address", Command::<P>::help(self));
+            };
+
+            if !json_tos.is_array() {
+                return format!("Couldn't parse argument as array\n{}", Command::<P>::help(self));
+            }
+
+            let fee: u64 = if json_args.has_key("fee") {
+                match json_args["fee"].as_u64() {
+                    Some(f) => f.clone(),
+                    None => DEFAULT_FEE.try_into().unwrap(),
+                }
+            } else {
+                DEFAULT_FEE.try_into().unwrap()
+            };
+
+            let script = if json_args.has_key("script") {
+                match json_args["script"].as_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return format!(
+                            "Error: {}\n{}",
+                            "script must be a string",
+                            Command::<P>::help(self)
+                        );
+                    }
+                }
+            } else {
+                return format!("Error: {}\n{}", "Need script", Command::<P>::help(self));
+            };
+
+            let all_zbalance = lightclient.wallet.verified_zbalance(None).await.checked_sub(fee);
+
+            let maybe_send_args = json_tos
+                .members()
+                .map(|j| {
+                    if !j.has_key("address") || !j.has_key("amount") {
+                        Err(format!("Need 'address' and 'amount'\n"))
+                    } else {
+                        let amount = match j["amount"].as_str() {
+                            Some("entire-verified-zbalance") => all_zbalance,
+                            _ => Some(j["amount"].as_u64().unwrap()),
+                        };
+
+                        match amount {
+                            Some(amt) => Ok((
+                                j["address"].as_str().unwrap().to_string().clone(),
+                                amt,
+                                j["memo"].as_str().map(|s| s.to_string().clone()),
+                            )),
+                            None => Err(format!("Not enough in wallet to pay transaction fee")),
+                        }
+                    }
+                })
+                .collect::<Result<Vec<(String, u64, Option<String>)>, String>>();
+
+            let send_args = match maybe_send_args {
+                Ok(a) => a.clone(),
+                Err(s) => {
+                    return format!("Error: {}\n{}", s, Command::<P>::help(self));
+                }
+            };
+
+            let tos = send_args
+                .iter()
+                .map(|(a, v, m)| (a.as_str(), *v, m.clone()))
+                .collect::<Vec<_>>();
+
+            match lightclient.do_sync(true).await {
+                Ok(_) => match lightclient.do_send_p2sh(from, tos, &fee, script.as_str()).await {
+                    Ok(txid) => object! { "txid" => txid },
+                    Err(e) => object! { "error" => e },
+                },
+                Err(e) => object! { "error" => e },
+            }
+            .pretty(2)
+        })
+    }
+}
+
+struct RedeemP2shCommand {}
+
+impl<P: consensus::Parameters + Send + Sync + 'static> Command<P> for RedeemP2shCommand {
+    fn help(&self) -> String {
+        let mut h = vec![];
+        h.push("Redeem/refund a P2SH HTLC output");
+        h.push("Usage:");
+        h.push("redeemp2sh '{'input': <p2sh address>, 'output': [{'address': <address>, 'amount': <amount in zatoshis>, 'memo': <optional memo>}, ...], 'fee': <fee>, 'script': <base58>, 'txid': <base58>, 'locktime': <locktime>, 'secret': <base58>, 'privkey': <base58>}'");
+        h.push("");
+        h.push("Fields:");
+        h.push("input   : P2SH address (t3)");
+        h.push("output  : array of outputs");
+        h.push("fee     : fee in zatoshis");
+        h.push("script  : Base58-encoded redeem script bytes");
+        h.push("txid    : Base58-encoded funding txid bytes");
+        h.push("locktime: 0 for redeem, >0 for refund");
+        h.push("secret  : Base58-encoded secret (empty for refund)");
+        h.push("privkey : Base58-encoded 32-byte private key");
+        h.push("");
+        h.join("\n")
+    }
+
+    fn short_help(&self) -> String {
+        "Redeem/refund a P2SH HTLC output".to_string()
+    }
+
+    fn exec(&self, args: &[&str], lightclient: &LightClient<P>) -> String {
+        if args.len() != 1 {
+            return Command::<P>::help(self);
+        }
+
+        RT.block_on(async move {
+            let json_args = match json::parse(args[0]) {
+                Ok(j) => j,
+                Err(e) => {
+                    let es = format!("Couldn't understand JSON: {}", e);
+                    return format!("{}\n{}", es, Command::<P>::help(self));
+                }
+            };
+
+            let input = if json_args.has_key("input") {
+                json_args["input"].as_str().unwrap().clone()
+            } else {
+                return format!("Error: {}\n{}", "Need input address", Command::<P>::help(self));
+            };
+
+            let json_tos = if json_args.has_key("output") {
+                &json_args["output"]
+            } else {
+                return format!("Error: {}\n{}", "Need output address", Command::<P>::help(self));
+            };
+
+            if !json_tos.is_array() {
+                return format!("Couldn't parse argument as array\n{}", Command::<P>::help(self));
+            }
+
+            let fee: u64 = if json_args.has_key("fee") {
+                match json_args["fee"].as_u64() {
+                    Some(f) => f.clone(),
+                    None => DEFAULT_FEE.try_into().unwrap(),
+                }
+            } else {
+                DEFAULT_FEE.try_into().unwrap()
+            };
+
+            let script = if json_args.has_key("script") {
+                json_args["script"].as_str().unwrap().to_string()
+            } else {
+                return format!("Error: {}\n{}", "Need redeem script", Command::<P>::help(self));
+            };
+
+            let txid = if json_args.has_key("txid") {
+                json_args["txid"].as_str().unwrap().to_string()
+            } else {
+                return format!("Error: {}\n{}", "Need funding txid", Command::<P>::help(self));
+            };
+
+            let locktime = if json_args.has_key("locktime") {
+                match json_args["locktime"].as_u64() {
+                    Some(l) => l,
+                    None => {
+                        return format!(
+                            "Error: {}\n{}",
+                            "locktime must be a number",
+                            Command::<P>::help(self)
+                        );
+                    }
+                }
+            } else {
+                return format!("Error: {}\n{}", "Need locktime", Command::<P>::help(self));
+            };
+
+            let secret = if json_args.has_key("secret") {
+                json_args["secret"].as_str().unwrap().to_string()
+            } else {
+                return format!("Error: {}\n{}", "Need secret", Command::<P>::help(self));
+            };
+
+            let privkey = if json_args.has_key("privkey") {
+                json_args["privkey"].as_str().unwrap().to_string()
+            } else {
+                return format!("Error: {}\n{}", "Need privkey", Command::<P>::help(self));
+            };
+
+            let maybe_outputs = json_tos
+                .members()
+                .map(|j| {
+                    if !j.has_key("address") || !j.has_key("amount") {
+                        Err(format!("Need 'address' and 'amount'\n"))
+                    } else {
+                        Ok((
+                            j["address"].as_str().unwrap().to_string(),
+                            j["amount"].as_u64().unwrap(),
+                            j["memo"].as_str().map(|s| s.to_string().clone()),
+                        ))
+                    }
+                })
+                .collect::<Result<Vec<(String, u64, Option<String>)>, String>>();
+
+            let outputs = match maybe_outputs {
+                Ok(a) => a.clone(),
+                Err(s) => {
+                    return format!("Error: {}\n{}", s, Command::<P>::help(self));
+                }
+            };
+
+            let tos = outputs
+                .iter()
+                .map(|(a, v, m)| (a.as_str(), *v, m.clone()))
+                .collect::<Vec<_>>();
+
+            match lightclient
+                .do_redeem_p2sh(
+                    input,
+                    tos,
+                    &fee,
+                    &script,
+                    &txid,
+                    locktime,
+                    &secret,
+                    &privkey,
+                )
+                .await
+            {
+                Ok(txid) => object! { "txid" => txid },
+                Err(e) => object! { "error" => e },
+            }
+            .pretty(2)
+        })
+    }
+}
+
 struct SaveCommand {}
 
 impl<P: consensus::Parameters + Send + Sync + 'static> Command<P> for SaveCommand {
@@ -1315,6 +1594,8 @@ pub fn get_commands<P: consensus::Parameters + Send + Sync + 'static>() -> Box<H
     map.insert("info".to_string(), Box::new(InfoCommand {}));
     map.insert("arrrprice".to_string(), Box::new(ArrrPriceCommand {}));
     map.insert("send".to_string(), Box::new(SendCommand {}));
+    map.insert("sendp2sh".to_string(), Box::new(SendP2shCommand {}));
+    map.insert("redeemp2sh".to_string(), Box::new(RedeemP2shCommand {}));
     // map.insert("shield".to_string(), Box::new(ShieldCommand {}));
     map.insert("save".to_string(), Box::new(SaveCommand {}));
     map.insert("quit".to_string(), Box::new(QuitCommand {}));

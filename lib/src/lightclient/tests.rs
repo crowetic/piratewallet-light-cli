@@ -762,7 +762,7 @@ async fn t_incoming_t_outgoing() {
 
     assert_eq!(list[1]["block_height"].as_u64().unwrap(), 12);
     assert_eq!(list[1]["txid"], sent_txid);
-    assert_eq!(list[1]["unconfirmed"].as_bool().unwrap(), false);
+    assert_eq!(list[1].contains("unconfirmed"), false);
     assert_eq!(list[1]["outgoing_metadata"][0]["address"], EXT_TADDR);
     assert_eq!(list[1]["outgoing_metadata"][0]["value"].as_u64().unwrap(), sent_value);
 
@@ -773,7 +773,7 @@ async fn t_incoming_t_outgoing() {
     let list = lc.do_list_transactions(false).await;
     assert_eq!(list[1]["block_height"].as_u64().unwrap(), 12);
     assert_eq!(list[1]["txid"], sent_txid);
-    assert_eq!(list[1]["unconfirmed"].as_bool().unwrap(), false);
+    assert_eq!(list[1].contains("unconfirmed"), false);
     assert_eq!(list[1]["outgoing_metadata"][0]["address"], EXT_TADDR);
     assert_eq!(list[1]["outgoing_metadata"][0]["value"].as_u64().unwrap(), sent_value);
 
