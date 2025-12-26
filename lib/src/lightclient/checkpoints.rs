@@ -1,8 +1,9 @@
 use serde_derive::Deserialize;
+use zcash_primitives::constants;
 
 #[derive(Deserialize, Clone)]
 pub struct CoinList {
-    pub coin_list: Vec<CheckPoints>
+    pub coin_list: Vec<CheckPoints>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -10,47 +11,57 @@ pub struct CheckPoints {
     pub coin_name: String,
     pub coin_type: u32,
     pub chain_name: String,
-    pub check_points : Vec<CheckPoint>
+    pub check_points: Vec<CheckPoint>,
 }
 
 #[derive(Deserialize, Clone)]
 pub struct CheckPoint {
     pub height: u64,
     pub hash: String,
-    pub sapling_tree: String
+    pub sapling_tree: String,
 }
 
+pub fn get_closest_checkpoint(chain_name: &str, coin_type: u32, height: u64) -> Option<(u64, String, String)> {
+    find_checkpoint(height, get_checkpoints(chain_name, coin_type))
+}
 
-pub fn get_closest_checkpoint(chain_name: &str, coin_type: u32, height: u64) ->  Option<(u64, String, String)> {
+pub fn get_all_main_checkpoints() -> Vec<(u64, String, String)> {
+    get_checkpoints("main", constants::mainnet::COIN_TYPE)
+}
 
+fn get_checkpoints(chain_name: &str, coin_type: u32) -> Vec<(u64, String, String)> {
     let mut checkpoints: Vec<(u64, String, String)> = Vec::new();
 
-    let cps = match reqwest::blocking::get("https://raw.githubusercontent.com/Qortal/piratewallet-light-cli/master/coin-checkpoint.json") {
-        Ok(s) => {
-            match s.json::<CoinList>() {
-                Ok(j) => Some(j),
-                Err(_) => None
-            }
+    let cps = match reqwest::blocking::get(
+        "https://raw.githubusercontent.com/Qortal/piratewallet-light-cli/master/coin-checkpoint.json",
+    ) {
+        Ok(s) => match s.json::<CoinList>() {
+            Ok(j) => Some(j),
+            Err(_) => None,
         },
-        Err(_) => None
+        Err(_) => None,
     };
 
     match cps {
         Some(s) => {
             for coin in 0..s.coin_list.len() {
-                if s.coin_list[coin].coin_type == coin_type && s.coin_list[coin].chain_name == chain_name {
+                if s.coin_list[coin].coin_type == coin_type
+                    && s.coin_list[coin].chain_name == chain_name
+                {
                     for points in 0..s.coin_list[coin].check_points.len() {
-                        checkpoints.push((s.coin_list[coin].check_points[points].height
-                                        , s.coin_list[coin].check_points[points].hash.clone()
-                                        , s.coin_list[coin].check_points[points].sapling_tree.clone()))
+                        checkpoints.push((
+                            s.coin_list[coin].check_points[points].height,
+                            s.coin_list[coin].check_points[points].hash.clone(),
+                            s.coin_list[coin].check_points[points].sapling_tree.clone(),
+                        ))
                     }
                 }
             }
-        },
+        }
         None => {}
     }
 
-    find_checkpoint(height, checkpoints)
+    checkpoints
 }
 
 fn find_checkpoint(height: u64, chkpts: Vec<(u64, String, String)>) -> Option<(u64, String, String)> {
@@ -59,10 +70,11 @@ fn find_checkpoint(height: u64, chkpts: Vec<(u64, String, String)>) -> Option<(u
     heights.sort();
 
     match get_first_lower_than(height, heights) {
-        Some(closest_height) => {
-            chkpts.iter().find(|(h, _, _)| *h ==  closest_height).map(|t| (t.0, t.1.clone(), t.2.clone()))
-        },
-        None    => None
+        Some(closest_height) => chkpts
+            .iter()
+            .find(|(h, _, _)| *h == closest_height)
+            .map(|t| (t.0, t.1.clone(), t.2.clone())),
+        None => None,
     }
 }
 
@@ -74,11 +86,11 @@ fn get_first_lower_than(height: u64, heights: Vec<u64>) -> Option<u64> {
 
     for (i, h) in heights.iter().enumerate() {
         if height < *h {
-            return Some(heights[i-1]);
+            return Some(heights[i - 1]);
         }
     }
 
-    return Some(*heights.last().unwrap());
+    Some(*heights.last().unwrap())
 }
 
 #[cfg(test)]
@@ -87,7 +99,7 @@ pub mod tests {
 
     #[test]
     fn test_lower_than() {
-        assert_eq!(get_first_lower_than( 9, vec![10, 30, 40]), None);
+        assert_eq!(get_first_lower_than(9, vec![10, 30, 40]), None);
         assert_eq!(get_first_lower_than(10, vec![10, 30, 40]).unwrap(), 10);
         assert_eq!(get_first_lower_than(11, vec![10, 30, 40]).unwrap(), 10);
         assert_eq!(get_first_lower_than(29, vec![10, 30, 40]).unwrap(), 10);
@@ -96,18 +108,4 @@ pub mod tests {
         assert_eq!(get_first_lower_than(41, vec![10, 30, 40]).unwrap(), 40);
         assert_eq!(get_first_lower_than(99, vec![10, 30, 40]).unwrap(), 40);
     }
-
-    #[test]
-    fn test_checkpoints() {
-        assert_eq!(get_test_checkpoint(500000), None);
-        assert_eq!(get_test_checkpoint(600000).unwrap().0, 600000);
-        assert_eq!(get_test_checkpoint(625000).unwrap().0, 600000);
-        assert_eq!(get_test_checkpoint(650000).unwrap().0, 650000);
-        assert_eq!(get_test_checkpoint(655000).unwrap().0, 650000);
-
-        assert_eq!(get_main_checkpoint(500000), None);
-        assert_eq!(get_main_checkpoint(610000).unwrap().0, 610000);
-        assert_eq!(get_main_checkpoint(625000).unwrap().0, 610000);
-    }
-
 }
