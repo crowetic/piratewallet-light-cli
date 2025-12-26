@@ -1,6 +1,5 @@
-target/
-.vscode/
-history.txt
-/.idea/
-tarpaulin-report.html
-/log*
+/target
+/testdata
+/procgov
+.DS_Store
+*.json.txt
